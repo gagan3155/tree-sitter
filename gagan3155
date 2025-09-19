@@ -1,0 +1,257 @@
+// server.js
+// Play-money Aviator prototype (Node.js + Express + socket.io)
+// Run: node server.js
+
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const crypto = require('crypto');
+const cors = require('cors');
+const { v4: uuidv4 } = require('uuid');
+
+const app = express();
+app.use(cors());
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
+
+const PORT = process.env.PORT || 3000;
+
+/* In-memory stores (prototype only) */
+let rounds = {};  // roundId -> round object
+let users = {};   // socketId -> {id, name, balance}
+
+/* Utility: derive HMAC hex using serverSeed and clientSeed (clientSeed optional) */
+function hmacHex(serverSeed, clientSeed = '') {
+  return crypto.createHmac('sha256', serverSeed).update(clientSeed).digest('hex');
+}
+
+/* Convert first 13 hex chars => float in [0,1) */
+function hexToFloat(hexStr) {
+  const slice = hexStr.slice(0, 13);
+  const num = parseInt(slice, 16);
+  const denom = Math.pow(16, slice.length);
+  return num / denom;
+}
+
+/* Deterministic mapping from HMAC hex -> crash multiplier */
+function deriveCrashMultiplier(hmacHexStr) {
+  const p = hexToFloat(hmacHexStr);
+  const cappedP = Math.min(p, 0.999999999999);
+  // mapping: crash = floor((1 / (1 - p)) * 100) / 100
+  const crash = Math.floor((1 / (1 - cappedP)) * 100) / 100;
+  // avoid absurdly huge numbers for demo readability:
+  return Math.min(crash, 100000);
+}
+
+/* Create new round and schedule lifecycle */
+function createRound() {
+  const id = uuidv4();
+  const serverSeed = crypto.randomBytes(32).toString('hex'); // secret, revealed after round
+  const serverSeedHash = crypto.createHash('sha256').update(serverSeed).digest('hex');
+
+  const hmac = hmacHex(serverSeed, ''); // empty clientSeed for prototype
+  const crash = deriveCrashMultiplier(hmac);
+
+  const preOpenMs = 8000; // players can join for 8s
+  const startedAt = null;
+
+  rounds[id] = {
+    id,
+    serverSeed,         // keep secret until reveal
+    serverSeedHash,     // publish during join period
+    hmac,
+    crashMultiplier: crash,
+    state: 'open',      // open -> started -> crashed -> finished
+    createdAt: Date.now(),
+    openUntil: Date.now() + preOpenMs,
+    startedAt: null,
+    durationMs: null,   // will be set at start
+    players: {},        // socketId -> {bet, cashedOutAt, payout, cashedMultiplier}
+  };
+
+  // Broadcast open round to all clients
+  io.emit('round:open', {
+    id,
+    serverSeedHash,
+    openUntil: rounds[id].openUntil,
+  });
+
+  // Schedule start
+  setTimeout(() => startRound(id), preOpenMs + 50);
+}
+
+/* Start the round: set startedAt and simulate multiplier ticks.
+   Duration is derived from the hmac for some deterministic variety.
+*/
+function startRound(roundId) {
+  const r = rounds[roundId];
+  if (!r) return;
+  r.state = 'started';
+  r.startedAt = Date.now();
+
+  // deterministic jitter derived from hmac
+  const jitter = parseInt(r.hmac.slice(13, 17), 16) % 2000; // 0..1999 ms
+  const baseDuration = 5000; // base 5 seconds
+  const durationMs = Math.max(2000, Math.min(15000, baseDuration + jitter));
+  r.durationMs = durationMs;
+
+  io.emit('round:started', { id: r.id, startedAt: r.startedAt, durationMs });
+
+  // tick loop
+  const tickInterval = 100; // ms
+  const tick = setInterval(() => {
+    const elapsed = Date.now() - r.startedAt;
+    // multiplier increases toward crash: multiplier(t) = crash^(t/duration)
+    const frac = Math.min(1, elapsed / r.durationMs);
+    const currentMultiplier = Math.pow(r.crashMultiplier, frac);
+    io.emit('round:tick', {
+      id: r.id,
+      multiplier: Number(currentMultiplier.toFixed(2)),
+      elapsed,
+      frac,
+    });
+
+    if (elapsed >= r.durationMs) {
+      clearInterval(tick);
+      // crash now
+      r.state = 'crashed';
+      r.crashedAt = Date.now();
+      io.emit('round:crash', {
+        id: r.id,
+        crashMultiplier: r.crashMultiplier,
+      });
+
+      // reveal the server seed so clients can verify
+      io.emit('round:reveal', {
+        id: r.id,
+        serverSeed: r.serverSeed,
+        hmac: r.hmac,
+        crashMultiplier: r.crashMultiplier,
+      });
+
+      // finalize payouts for players who haven't cashed out (they lose bet)
+      for (const sid in r.players) {
+        const p = r.players[sid];
+        if (!p.cashedOut) {
+          p.payout = 0;
+          p.cashedMultiplier = null;
+        }
+      }
+
+      // After a short delay, mark finished and create next round
+      setTimeout(() => {
+        r.state = 'finished';
+        io.emit('round:finished', { id: r.id });
+        // create next round
+        createRound();
+      }, 2000);
+    }
+  }, tickInterval);
+}
+
+/* Start first round immediately */
+createRound();
+
+/* Socket.io handlers for players */
+io.on('connection', (socket) => {
+  console.log('connect', socket.id);
+  // create user with demo balance
+  users[socket.id] = {
+    id: socket.id,
+    name: `Guest-${socket.id.slice(0,5)}`,
+    balance: 1000, // demo coins
+  };
+
+  // Send user info + current open rounds
+  const openRounds = Object.values(rounds).filter(r => r.state === 'open').map(r => ({
+    id: r.id, serverSeedHash: r.serverSeedHash, openUntil: r.openUntil
+  }));
+
+  socket.emit('welcome', { user: users[socket.id], openRounds });
+
+  socket.on('placeBet', ({ roundId, amount }) => {
+    const u = users[socket.id];
+    const r = rounds[roundId];
+    if (!u || !r) {
+      socket.emit('bet:fail', { msg: 'Invalid user or round' });
+      return;
+    }
+    if (r.state !== 'open') {
+      socket.emit('bet:fail', { msg: 'Round not open' });
+      return;
+    }
+    if (amount <= 0 || amount > u.balance) {
+      socket.emit('bet:fail', { msg: 'Invalid bet amount' });
+      return;
+    }
+    // Deduct immediately (atomic in DB in prod)
+    u.balance -= amount;
+    r.players[socket.id] = {
+      bet: amount,
+      cashedOut: false,
+      cashedMultiplier: null,
+      payout: null,
+    };
+    socket.emit('bet:ok', { balance: u.balance, roundId });
+    io.emit('round:playerJoined', { roundId, playerId: socket.id });
+  });
+
+  socket.on('cashout', ({ roundId }) => {
+    const r = rounds[roundId];
+    const u = users[socket.id];
+    if (!r || !u) {
+      socket.emit('cashout:fail', { msg: 'Invalid user or round' });
+      return;
+    }
+    const p = r.players[socket.id];
+    if (!p || p.cashedOut) {
+      socket.emit('cashout:fail', { msg: 'No active bet or already cashed out' });
+      return;
+    }
+    if (r.state !== 'started') {
+      socket.emit('cashout:fail', { msg: 'Round not running' });
+      return;
+    }
+    // server authoritative multiplier at this moment:
+    const elapsed = Date.now() - r.startedAt;
+    const frac = Math.min(1, elapsed / r.durationMs);
+    const currentMultiplier = Math.pow(r.crashMultiplier, frac);
+    // if round already crashed, cashout fails
+    if (frac >= 1) {
+      p.cashedOut = true;
+      p.payout = 0;
+      p.cashedMultiplier = null;
+      socket.emit('cashout:fail', { msg: 'Round already crashed', balance: u.balance });
+      return;
+    }
+    // payout = bet * currentMultiplier
+    const payout = Math.floor(p.bet * currentMultiplier);
+    p.cashedOut = true;
+    p.payout = payout;
+    p.cashedMultiplier = Number(currentMultiplier.toFixed(2));
+    // credit user balance
+    u.balance += payout;
+    socket.emit('cashout:ok', { payout, multiplier: p.cashedMultiplier, balance: u.balance });
+    io.emit('round:playerCashed', { roundId, playerId: socket.id, multiplier: p.cashedMultiplier, payout });
+  });
+
+  socket.on('disconnect', () => {
+    console.log('disconnect', socket.id);
+    delete users[socket.id];
+  });
+});
+
+/* Minimal REST endpoint to see recent rounds (for debug) */
+app.get('/rounds', (req, res) => {
+  res.json(Object.values(rounds).map(r => ({
+    id: r.id,
+    state: r.state,
+    crashMultiplier: r.crashMultiplier,
+    serverSeedHash: r.serverSeedHash,
+    createdAt: r.createdAt,
+  })));
+});
+
+server.listen(PORT, () => {
+  console.log(`Server listening on ${PORT}`);
+});
